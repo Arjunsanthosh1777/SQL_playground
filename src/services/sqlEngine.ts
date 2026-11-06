@@ -2,7 +2,7 @@
  * Client-Side SQLite WebAssembly Engine
  * Runs SQLite directly inside the browser using sql.js.
  * Guarantees 100% functionality on static hosting platforms (Vercel, GitHub Pages, Netlify)
- * without requiring any backend Node.js server.
+ * with robust multi-statement parsing, line-accurate error reporting, and multi-result support.
  */
 
 import initSqlJs, { Database, SqlJsStatic } from 'sql.js';
@@ -10,6 +10,104 @@ import { DATASETS, DatasetMeta } from '../data/seedData.ts';
 import { CHALLENGES, Challenge } from '../data/challengesData.ts';
 import { validateSqlQuery, sanitizeSqlError } from '../data/security.ts';
 import { TableSchema, ExecutionResponse, QueryResultItem, VerificationResult } from '../types/index.ts';
+
+export interface ParsedStatement {
+  sql: string;
+  lineNumber: number;
+}
+
+/**
+ * Splits complex multi-statement SQL scripts by semicolons,
+ * respecting string literals, quotes, and comments while tracking line numbers.
+ */
+export function splitSqlStatements(sql: string): ParsedStatement[] {
+  const statements: ParsedStatement[] = [];
+  let current = '';
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+  let line = 1;
+  let startLine = 1;
+
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i];
+    const next = sql[i + 1];
+
+    if (ch === '\n') {
+      line++;
+      if (inLineComment) inLineComment = false;
+    }
+
+    if (inLineComment) {
+      current += ch;
+      continue;
+    }
+
+    if (inBlockComment) {
+      current += ch;
+      if (ch === '*' && next === '/') {
+        inBlockComment = false;
+        current += '/';
+        i++;
+      }
+      continue;
+    }
+
+    if (!inSingleQuote && !inDoubleQuote) {
+      if (ch === '-' && next === '-') {
+        inLineComment = true;
+        current += ch;
+        continue;
+      }
+      if (ch === '/' && next === '*') {
+        inBlockComment = true;
+        current += ch;
+        continue;
+      }
+    }
+
+    if (ch === "'" && !inDoubleQuote) {
+      if (inSingleQuote && next === "'") {
+        current += "''";
+        i++;
+        continue;
+      }
+      inSingleQuote = !inSingleQuote;
+    } else if (ch === '"' && !inSingleQuote) {
+      if (inDoubleQuote && next === '"') {
+        current += '""';
+        i++;
+        continue;
+      }
+      inDoubleQuote = !inDoubleQuote;
+    }
+
+    if (ch === ';' && !inSingleQuote && !inDoubleQuote) {
+      const stripped = current.replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
+      if (stripped.length > 0) {
+        statements.push({ sql: current.trim(), lineNumber: startLine });
+      }
+      current = '';
+      startLine = line;
+      continue;
+    }
+
+    if (current.length === 0 && (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r')) {
+      startLine = line;
+      continue;
+    }
+
+    current += ch;
+  }
+
+  const trailingStripped = current.replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  if (trailingStripped.length > 0) {
+    statements.push({ sql: current.trim(), lineNumber: startLine });
+  }
+
+  return statements;
+}
 
 class ClientSqlEngine {
   private SQL: SqlJsStatic | null = null;
@@ -24,7 +122,6 @@ class ClientSqlEngine {
 
     this.initPromise = (async () => {
       try {
-        // Try local wasm first (served from /sql-wasm.wasm), then fallback to CDN
         this.SQL = await initSqlJs({
           locateFile: (file) => {
             if (file.endsWith('.wasm')) {
@@ -45,7 +142,6 @@ class ClientSqlEngine {
         });
       }
 
-      // Build pristine snapshots for each dataset
       for (const [id, meta] of Object.entries(DATASETS)) {
         const db = new this.SQL.Database();
         db.run(meta.sqlSeed);
@@ -104,59 +200,103 @@ class ClientSqlEngine {
 
     try {
       const db = this.getOrCreateDb(datasetId);
-      const cleanSql = sql.trim();
-      const firstWord = cleanSql.split(/\s+/)[0]?.toUpperCase() || '';
+      const parsedStatements = splitSqlStatements(sql);
 
-      let statementType: 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE' | 'DDL' | 'OTHER' = 'OTHER';
-      if (['SELECT', 'WITH', 'EXPLAIN', 'PRAGMA'].includes(firstWord)) statementType = 'SELECT';
-      else if (firstWord === 'INSERT') statementType = 'INSERT';
-      else if (firstWord === 'UPDATE') statementType = 'UPDATE';
-      else if (firstWord === 'DELETE') statementType = 'DELETE';
-      else if (['CREATE', 'ALTER', 'DROP'].includes(firstWord)) statementType = 'DDL';
-
-      const rowsBefore = db.getRowsModified();
-      const rawResults = db.exec(cleanSql);
-      const rowsAfter = db.getRowsModified();
-      const rowsAffected = rowsAfter - rowsBefore;
+      if (parsedStatements.length === 0) {
+        return {
+          success: false,
+          results: [],
+          executionTimeMs: 0,
+          error: 'No executable SQL statements found in query.',
+        };
+      }
 
       const results: QueryResultItem[] = [];
       const warnings: string[] = [];
+      let totalRowsAffected = 0;
 
-      if (rawResults.length === 0) {
-        results.push({
-          columns: [],
-          values: [],
-          rowCount: 0,
-          truncated: false,
-          statementType,
-          rowsAffected: Math.max(0, rowsAffected),
-        });
-      } else {
-        for (const res of rawResults) {
-          const totalRows = res.values.length;
-          const isTruncated = totalRows > this.maxRows;
-          const values = isTruncated ? res.values.slice(0, this.maxRows) : res.values;
+      for (let sIdx = 0; sIdx < parsedStatements.length; sIdx++) {
+        const stmt = parsedStatements[sIdx];
+        const cleanStmt = stmt.sql.trim();
+        const firstWord = cleanStmt.replace(/^--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim().split(/\s+/)[0]?.toUpperCase() || '';
 
-          if (isTruncated) {
-            warnings.push(`Result truncated: showing first ${this.maxRows} of ${totalRows} rows.`);
+        let statementType: 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE' | 'DDL' | 'OTHER' = 'OTHER';
+        if (['SELECT', 'WITH', 'EXPLAIN', 'PRAGMA'].includes(firstWord)) statementType = 'SELECT';
+        else if (firstWord === 'INSERT') statementType = 'INSERT';
+        else if (firstWord === 'UPDATE') statementType = 'UPDATE';
+        else if (firstWord === 'DELETE') statementType = 'DELETE';
+        else if (['CREATE', 'ALTER', 'DROP'].includes(firstWord)) statementType = 'DDL';
+
+        try {
+          if (statementType === 'SELECT') {
+            const rawResults = db.exec(cleanStmt);
+            if (rawResults.length === 0) {
+              results.push({
+                columns: [],
+                values: [],
+                rowCount: 0,
+                truncated: false,
+                statementType: 'SELECT',
+              });
+            } else {
+              for (const res of rawResults) {
+                const totalRows = res.values.length;
+                const isTruncated = totalRows > this.maxRows;
+                const values = isTruncated ? res.values.slice(0, this.maxRows) : res.values;
+
+                if (isTruncated) {
+                  warnings.push(`Result truncated: showing first ${this.maxRows} of ${totalRows} rows.`);
+                }
+
+                results.push({
+                  columns: res.columns,
+                  values,
+                  rowCount: totalRows,
+                  truncated: isTruncated,
+                  statementType: 'SELECT',
+                });
+              }
+            }
+          } else {
+            const rowsBefore = db.getRowsModified();
+            db.run(cleanStmt);
+            const rowsAfter = db.getRowsModified();
+            const affected = Math.max(0, rowsAfter - rowsBefore);
+            totalRowsAffected += affected;
+
+            // Only add DDL/DML result entry if it's the sole statement or final statement without subsequent selects
+            results.push({
+              columns: [],
+              values: [],
+              rowCount: 0,
+              truncated: false,
+              statementType,
+              rowsAffected: affected,
+            });
           }
+        } catch (stmtErr) {
+          // If a statement in a transaction fails, rollback to prevent broken state
+          try { db.exec('ROLLBACK;'); } catch {}
 
-          results.push({
-            columns: res.columns,
-            values,
-            rowCount: totalRows,
-            truncated: isTruncated,
-            statementType: 'SELECT',
-            rowsAffected: rowsAffected > 0 ? rowsAffected : undefined,
-          });
+          const executionTimeMs = parseFloat((performance.now() - startTime).toFixed(2));
+          return {
+            success: false,
+            results: [],
+            executionTimeMs,
+            error: sanitizeSqlError(stmtErr, stmt.sql, stmt.lineNumber),
+          };
         }
       }
+
+      // If there are SELECT results, prioritize them, but keep non-select counts intact
+      const selectResults = results.filter(r => r.statementType === 'SELECT' && r.columns.length > 0);
+      const finalResults = selectResults.length > 0 ? selectResults : results;
 
       const executionTimeMs = parseFloat((performance.now() - startTime).toFixed(2));
 
       return {
         success: true,
-        results,
+        results: finalResults,
         executionTimeMs,
         warnings: warnings.length > 0 ? warnings : undefined,
       };

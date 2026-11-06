@@ -6,6 +6,7 @@
 import initSqlJs, { Database, SqlJsStatic } from 'sql.js';
 import { DATASETS } from './seedData.ts';
 import { validateSqlQuery, sanitizeSqlError } from './security.ts';
+import { splitSqlStatements } from '../src/services/sqlEngine.ts';
 
 export interface ColumnInfo {
   name: string;
@@ -148,60 +149,100 @@ export class DatabaseManager {
 
     try {
       const db = this.getOrCreateSessionDb(sessionId, datasetId);
-      const cleanSql = sql.trim();
-      const firstWord = cleanSql.split(/\s+/)[0]?.toUpperCase() || '';
-      
-      let statementType: 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE' | 'DDL' | 'OTHER' = 'OTHER';
-      if (['SELECT', 'WITH', 'EXPLAIN', 'PRAGMA'].includes(firstWord)) statementType = 'SELECT';
-      else if (firstWord === 'INSERT') statementType = 'INSERT';
-      else if (firstWord === 'UPDATE') statementType = 'UPDATE';
-      else if (firstWord === 'DELETE') statementType = 'DELETE';
-      else if (['CREATE', 'ALTER', 'DROP'].includes(firstWord)) statementType = 'DDL';
+      const parsedStatements = splitSqlStatements(sql);
 
-      const rowsBefore = db.getRowsModified();
-      const rawResults = db.exec(cleanSql);
-      const rowsAfter = db.getRowsModified();
-      const rowsAffected = rowsAfter - rowsBefore;
+      if (parsedStatements.length === 0) {
+        return {
+          success: false,
+          results: [],
+          executionTimeMs: 0,
+          error: 'No executable SQL statements found in query.',
+        };
+      }
 
       const results: QueryResultItem[] = [];
       const warnings: string[] = [];
+      let totalRowsAffected = 0;
 
-      if (rawResults.length === 0) {
-        // Query succeeded but returned no rows (e.g. INSERT, UPDATE, DELETE, CREATE, DROP)
-        results.push({
-          columns: [],
-          values: [],
-          rowCount: 0,
-          truncated: false,
-          statementType,
-          rowsAffected: Math.max(0, rowsAffected),
-        });
-      } else {
-        for (const res of rawResults) {
-          const totalRows = res.values.length;
-          const isTruncated = totalRows > this.maxRows;
-          const values = isTruncated ? res.values.slice(0, this.maxRows) : res.values;
-          
-          if (isTruncated) {
-            warnings.push(`Result truncated: showing first ${this.maxRows} of ${totalRows} rows.`);
+      for (let sIdx = 0; sIdx < parsedStatements.length; sIdx++) {
+        const stmt = parsedStatements[sIdx];
+        const cleanStmt = stmt.sql.trim();
+        const firstWord = cleanStmt.replace(/^--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim().split(/\s+/)[0]?.toUpperCase() || '';
+
+        let statementType: 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE' | 'DDL' | 'OTHER' = 'OTHER';
+        if (['SELECT', 'WITH', 'EXPLAIN', 'PRAGMA'].includes(firstWord)) statementType = 'SELECT';
+        else if (firstWord === 'INSERT') statementType = 'INSERT';
+        else if (firstWord === 'UPDATE') statementType = 'UPDATE';
+        else if (firstWord === 'DELETE') statementType = 'DELETE';
+        else if (['CREATE', 'ALTER', 'DROP'].includes(firstWord)) statementType = 'DDL';
+
+        try {
+          if (statementType === 'SELECT') {
+            const rawResults = db.exec(cleanStmt);
+            if (rawResults.length === 0) {
+              results.push({
+                columns: [],
+                values: [],
+                rowCount: 0,
+                truncated: false,
+                statementType: 'SELECT',
+              });
+            } else {
+              for (const res of rawResults) {
+                const totalRows = res.values.length;
+                const isTruncated = totalRows > this.maxRows;
+                const values = isTruncated ? res.values.slice(0, this.maxRows) : res.values;
+
+                if (isTruncated) {
+                  warnings.push(`Result truncated: showing first ${this.maxRows} of ${totalRows} rows.`);
+                }
+
+                results.push({
+                  columns: res.columns,
+                  values,
+                  rowCount: totalRows,
+                  truncated: isTruncated,
+                  statementType: 'SELECT',
+                });
+              }
+            }
+          } else {
+            const rowsBefore = db.getRowsModified();
+            db.run(cleanStmt);
+            const rowsAfter = db.getRowsModified();
+            const affected = Math.max(0, rowsAfter - rowsBefore);
+            totalRowsAffected += affected;
+
+            results.push({
+              columns: [],
+              values: [],
+              rowCount: 0,
+              truncated: false,
+              statementType,
+              rowsAffected: affected,
+            });
           }
+        } catch (stmtErr) {
+          try { db.exec('ROLLBACK;'); } catch {}
 
-          results.push({
-            columns: res.columns,
-            values,
-            rowCount: totalRows,
-            truncated: isTruncated,
-            statementType: 'SELECT',
-            rowsAffected: rowsAffected > 0 ? rowsAffected : undefined,
-          });
+          const executionTimeMs = parseFloat((performance.now() - startTime).toFixed(2));
+          return {
+            success: false,
+            results: [],
+            executionTimeMs,
+            error: sanitizeSqlError(stmtErr, stmt.sql, stmt.lineNumber),
+          };
         }
       }
+
+      const selectResults = results.filter(r => r.statementType === 'SELECT' && r.columns.length > 0);
+      const finalResults = selectResults.length > 0 ? selectResults : results;
 
       const executionTimeMs = parseFloat((performance.now() - startTime).toFixed(2));
 
       return {
         success: true,
-        results,
+        results: finalResults,
         executionTimeMs,
         warnings: warnings.length > 0 ? warnings : undefined,
       };

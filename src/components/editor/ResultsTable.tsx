@@ -30,9 +30,14 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({ result, isExecuting 
   const [sortCol, setSortCol] = useState<number | null>(null);
   const [sortAsc, setSortAsc] = useState<boolean>(true);
   const [copiedCell, setCopiedCell] = useState<string | null>(null);
+  const [selectedResultIndex, setSelectedResultIndex] = useState<number>(0);
 
-  // Default to first result item
-  const currentResultItem = result?.results && result.results.length > 0 ? result.results[0] : null;
+  // Keep selected index in valid range
+  const safeIndex = result?.results && result.results.length > 0
+    ? Math.min(selectedResultIndex, result.results.length - 1)
+    : 0;
+
+  const currentResultItem = result?.results && result.results.length > 0 ? result.results[safeIndex] : null;
   const columns = currentResultItem?.columns || [];
   const rawValues = currentResultItem?.values || [];
 
@@ -102,7 +107,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({ result, isExecuting 
     return (
       <div className="h-full flex flex-col items-center justify-center p-8 bg-white dark:bg-slate-900 text-slate-400">
         <div className="w-8 h-8 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin mb-3" />
-        <span className="text-xs font-medium">Executing query in isolated sandbox...</span>
+        <span className="text-xs font-medium">Executing SQL statements...</span>
       </div>
     );
   }
@@ -112,7 +117,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({ result, isExecuting 
       <div className="h-full flex flex-col items-center justify-center p-8 bg-white dark:bg-slate-900 text-slate-400 dark:text-slate-500">
         <Clock className="w-8 h-8 mb-2 opacity-50" />
         <p className="text-xs font-medium">Write a SQL query above and click "Run Query" (⌘Enter).</p>
-        <p className="text-[11px] text-slate-400 mt-1">Output columns and records will appear here.</p>
+        <p className="text-[11px] text-slate-400 mt-1">Supports multi-statement scripts, CTEs, joins, and table creations.</p>
       </div>
     );
   }
@@ -123,15 +128,20 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({ result, isExecuting 
       <div className="h-full p-4 overflow-y-auto bg-rose-50/50 dark:bg-rose-950/20 text-rose-900 dark:text-rose-200">
         <div className="flex items-start gap-3 p-4 bg-white dark:bg-slate-900 border border-rose-200 dark:border-rose-900/60 rounded-xl shadow-xs">
           <XCircle className="w-5 h-5 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
-          <div className="space-y-1">
-            <h4 className="text-xs font-semibold text-rose-800 dark:text-rose-300">
-              Query Execution Error
-            </h4>
-            <pre className="text-xs font-mono whitespace-pre-wrap text-rose-700 dark:text-rose-400 break-all bg-rose-50/80 dark:bg-rose-950/40 p-2.5 rounded-lg border border-rose-100 dark:border-rose-900/30">
+          <div className="space-y-2 flex-1">
+            <div className="flex items-center justify-between">
+              <h4 className="text-xs font-semibold text-rose-800 dark:text-rose-300">
+                SQL Execution Error
+              </h4>
+              <span className="text-[10px] text-slate-400 font-mono">
+                Stopped at failing statement
+              </span>
+            </div>
+            <pre className="text-xs font-mono whitespace-pre-wrap text-rose-700 dark:text-rose-400 break-all bg-rose-50/80 dark:bg-rose-950/40 p-3 rounded-lg border border-rose-100 dark:border-rose-900/30 leading-relaxed">
               {result.error}
             </pre>
             <div className="text-[11px] text-slate-500 dark:text-slate-400 pt-1">
-              Check the Database Explorer on the sidebar for exact table names and available columns.
+              Tip: In multi-statement scripts, verify each statement ends with a semicolon (;) and references existing columns.
             </div>
           </div>
         </div>
@@ -141,6 +151,39 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({ result, isExecuting 
 
   return (
     <div className="h-full flex flex-col bg-white dark:bg-slate-900">
+      {/* Multiple Result Sets Tab Bar (if query produced >1 result set) */}
+      {result.results.length > 1 && (
+        <div className="px-3 py-1.5 border-b border-slate-200 dark:border-slate-800 bg-slate-100/80 dark:bg-slate-800/60 flex items-center gap-1.5 overflow-x-auto text-xs">
+          <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider shrink-0 mr-1">
+            Result Sets:
+          </span>
+          {result.results.map((resItem, idx) => {
+            const isTabActive = safeIndex === idx;
+            return (
+              <button
+                key={idx}
+                onClick={() => {
+                  setSelectedResultIndex(idx);
+                  setCurrentPage(1);
+                  setSearchTerm('');
+                  setSortCol(null);
+                }}
+                className={`px-3 py-1 rounded-md text-xs font-mono whitespace-nowrap shrink-0 transition-colors ${
+                  isTabActive
+                    ? 'bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 font-bold shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <span>Result #{idx + 1}</span>
+                <span className="ml-1.5 opacity-70">
+                  ({resItem.statementType === 'SELECT' ? `${resItem.rowCount} rows` : `${resItem.rowsAffected ?? 0} affected`})
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       {/* Results Header Status Bar */}
       <div className="px-3 py-2 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/90 flex flex-wrap items-center justify-between gap-3 text-xs">
         {/* Left Stats */}
@@ -164,9 +207,18 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({ result, isExecuting 
             <span className="font-mono tabular-nums">
               {currentResultItem?.statementType === 'SELECT'
                 ? `${processedRows.length} ${processedRows.length === 1 ? 'row' : 'rows'}`
-                : `${currentResultItem?.rowsAffected ?? 0} affected`}
+                : `${currentResultItem?.rowsAffected ?? 0} rows affected`}
             </span>
           </span>
+
+          {result.results.length > 1 && (
+            <>
+              <span className="text-slate-300 dark:text-slate-700">·</span>
+              <span className="text-[11px] text-slate-500 font-mono">
+                Showing set {safeIndex + 1} of {result.results.length}
+              </span>
+            </>
+          )}
 
           {currentResultItem?.truncated && (
             <span className="text-[11px] text-amber-600 dark:text-amber-400 flex items-center gap-1">

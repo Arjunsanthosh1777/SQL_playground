@@ -59,6 +59,30 @@ export const SqlEditor: React.FC<SqlEditorProps> = ({ onExecute, isExecuting }) 
         ? `SELECT p.product_name, c.name AS category_name, s.company_name AS supplier\nFROM products p\nJOIN categories c ON p.category_id = c.category_id\nJOIN suppliers s ON p.supplier_id = s.supplier_id;`
         : `SELECT c.first_name, c.last_name, o.order_id, o.total_amount\nFROM customers c\nJOIN orders o ON c.customer_id = o.customer_id;`,
     },
+    {
+      label: 'Multi-Statement Script: CREATE + INSERT + SELECT',
+      sql: `-- Multi-Statement SQL Program
+CREATE TABLE IF NOT EXISTS project_tasks (
+  task_id INTEGER PRIMARY KEY,
+  title TEXT NOT NULL,
+  priority TEXT CHECK(priority IN ('High', 'Medium', 'Low')),
+  estimated_hours REAL DEFAULT 5.0
+);
+
+INSERT INTO project_tasks VALUES 
+  (1, 'Database Index Optimization', 'High', 8.5),
+  (2, 'User Authentication Flow', 'High', 12.0),
+  (3, 'Refactor UI Components', 'Medium', 6.0),
+  (4, 'Update Documentation', 'Low', 3.0);
+
+-- Query 1: All tasks ordered by priority
+SELECT * FROM project_tasks ORDER BY estimated_hours DESC;
+
+-- Query 2: Aggregate summary
+SELECT priority, COUNT(*) AS task_count, SUM(estimated_hours) AS total_hours
+FROM project_tasks
+GROUP BY priority;`,
+    },
   ];
 
   const handleCopy = () => {
