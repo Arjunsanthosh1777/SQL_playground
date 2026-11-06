@@ -26,6 +26,7 @@ export const ExplorerPage: React.FC = () => {
     setActivePage,
     resetCurrentDataset,
     isResetting,
+    executeQuery,
   } = useDatabase();
 
   const [tableData, setTableData] = useState<ExecutionResponse | null>(null);
@@ -38,19 +39,11 @@ export const ExplorerPage: React.FC = () => {
   useEffect(() => {
     if (!selectedTable) return;
     setIsLoadingData(true);
-    fetch('/api/execute', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        datasetId: activeDatasetId,
-        sql: `SELECT * FROM "${selectedTable.name}" LIMIT 50;`,
-      }),
-    })
-      .then(res => res.json())
+    executeQuery(`SELECT * FROM "${selectedTable.name}" LIMIT 50;`)
       .then(data => setTableData(data))
       .catch(err => console.error(err))
       .finally(() => setIsLoadingData(false));
-  }, [selectedTable, activeDatasetId]);
+  }, [selectedTable, activeDatasetId, executeQuery]);
 
   const handleQueryTable = (tableName: string) => {
     setEditorSql(`SELECT * FROM "${tableName}" LIMIT 25;`);

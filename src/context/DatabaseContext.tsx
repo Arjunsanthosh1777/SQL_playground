@@ -1,6 +1,8 @@
-import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
+import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
 import { DatasetMeta, TableSchema, ExecutionResponse } from '../types/index.ts';
 import { useHistory } from './HistoryContext.tsx';
+import { clientSqlEngine } from '../services/sqlEngine.ts';
+import { DATASETS } from '../data/seedData.ts';
 
 interface DatabaseContextType {
   datasets: DatasetMeta[];
@@ -27,7 +29,7 @@ const DatabaseContext = createContext<DatabaseContextType | undefined>(undefined
 
 export const DatabaseProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { userSettings, addHistoryItem } = useHistory();
-  const [datasets, setDatasets] = useState<DatasetMeta[]>([]);
+  const [datasets, setDatasets] = useState<DatasetMeta[]>(() => Object.values(DATASETS));
   const [activeDatasetId, setActiveDatasetId] = useState<string>(userSettings.defaultDataset || 'students');
   const [schema, setSchema] = useState<TableSchema[]>([]);
   const [activeTable, setActiveTable] = useState<TableSchema | null>(null);
@@ -35,6 +37,9 @@ export const DatabaseProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [isResetting, setIsResetting] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [activePage, setActivePage] = useState<string>('editor');
+
+  // Track if backend is available (true) or if running in static/Vercel client mode (false)
+  const isBackendAvailable = useRef<boolean | null>(null);
 
   const [editorSql, setEditorSql] = useState<string>(
     `-- Welcome to SQL Playground!
@@ -45,40 +50,94 @@ WHERE gpa >= 3.80
 ORDER BY gpa DESC;`
   );
 
+  // Initialize client-side SQLite engine as guaranteed fallback
+  useEffect(() => {
+    clientSqlEngine.init().catch(err => {
+      console.warn('Failed to initialize client SQL engine:', err);
+    });
+  }, []);
+
   // Fetch datasets list on mount
   useEffect(() => {
     fetch('/api/datasets')
-      .then(res => res.json())
-      .then(data => {
-        if (data.success && data.datasets) {
-          setDatasets(data.datasets);
+      .then(async res => {
+        const contentType = res.headers.get('content-type');
+        if (res.ok && contentType && contentType.includes('application/json')) {
+          const data = await res.json();
+          if (data.success && data.datasets) {
+            isBackendAvailable.current = true;
+            setDatasets(data.datasets);
+            return;
+          }
         }
+        // Vercel or static hosting mode (no backend running)
+        isBackendAvailable.current = false;
+        setDatasets(clientSqlEngine.getDatasets());
       })
-      .catch(err => console.error('Failed to load datasets:', err));
+      .catch(() => {
+        isBackendAvailable.current = false;
+        setDatasets(clientSqlEngine.getDatasets());
+      });
   }, []);
 
   // Fetch schema for active dataset
   const fetchSchema = useCallback(async (datasetId: string) => {
     setIsLoadingSchema(true);
+
+    // If already known that backend is not available, run client-side immediately
+    if (isBackendAvailable.current === false) {
+      await clientSqlEngine.init();
+      const clientTables = clientSqlEngine.getSchema(datasetId);
+      setSchema(clientTables);
+      setActiveTable(prev => {
+        if (prev) {
+          const found = clientTables.find(t => t.name === prev.name);
+          return found || clientTables[0] || null;
+        }
+        return clientTables[0] || null;
+      });
+      setIsLoadingSchema(false);
+      return;
+    }
+
     try {
       const res = await fetch(`/api/datasets/${datasetId}/schema`, {
         headers: {
           'x-session-id': userSettings.sessionId,
         },
       });
-      const data = await res.json();
-      if (data.success && data.tables) {
-        setSchema(data.tables);
-        setActiveTable(prev => {
-          if (prev) {
-            const found = data.tables.find((t: TableSchema) => t.name === prev.name);
-            return found || data.tables[0] || null;
-          }
-          return data.tables[0] || null;
-        });
+
+      const contentType = res.headers.get('content-type');
+      if (res.ok && contentType && contentType.includes('application/json')) {
+        const data = await res.json();
+        if (data.success && data.tables) {
+          isBackendAvailable.current = true;
+          setSchema(data.tables);
+          setActiveTable(prev => {
+            if (prev) {
+              const found = data.tables.find((t: TableSchema) => t.name === prev.name);
+              return found || data.tables[0] || null;
+            }
+            return data.tables[0] || null;
+          });
+          return;
+        }
       }
-    } catch (err) {
-      console.error('Error fetching schema:', err);
+
+      // Fallback to client engine
+      throw new Error('Backend unavailable');
+    } catch {
+      isBackendAvailable.current = false;
+      await clientSqlEngine.init();
+      const clientTables = clientSqlEngine.getSchema(datasetId);
+      setSchema(clientTables);
+      setActiveTable(prev => {
+        if (prev) {
+          const found = clientTables.find(t => t.name === prev.name);
+          return found || clientTables[0] || null;
+        }
+        return clientTables[0] || null;
+      });
     } finally {
       setIsLoadingSchema(false);
     }
@@ -91,8 +150,7 @@ ORDER BY gpa DESC;`
   const switchDataset = async (datasetId: string) => {
     if (datasetId === activeDatasetId) return;
     setActiveDatasetId(datasetId);
-    
-    // Provide a relevant default query for the selected dataset
+
     if (datasetId === 'students') {
       setEditorSql(`SELECT * FROM departments;\nSELECT * FROM courses LIMIT 5;`);
     } else if (datasetId === 'employees') {
@@ -107,23 +165,36 @@ ORDER BY gpa DESC;`
   const resetCurrentDataset = async () => {
     setIsResetting(true);
     try {
-      const res = await fetch('/api/reset', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-session-id': userSettings.sessionId,
-        },
-        body: JSON.stringify({ datasetId: activeDatasetId }),
-      });
-      const data = await res.json();
-      if (data.success) {
-        setStatusMessage(data.message || 'Dataset reset successfully.');
-        if (data.tables) {
-          setSchema(data.tables);
-          if (data.tables.length > 0) setActiveTable(data.tables[0]);
+      // Always reset client engine in case it's in use
+      await clientSqlEngine.init();
+      clientSqlEngine.resetDataset(activeDatasetId);
+
+      if (isBackendAvailable.current !== false) {
+        try {
+          const res = await fetch('/api/reset', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-session-id': userSettings.sessionId,
+            },
+            body: JSON.stringify({ datasetId: activeDatasetId }),
+          });
+          const data = await res.json();
+          if (data.success && data.tables) {
+            setSchema(data.tables);
+            if (data.tables.length > 0) setActiveTable(data.tables[0]);
+          }
+        } catch {
+          isBackendAvailable.current = false;
         }
-        setTimeout(() => setStatusMessage(null), 4000);
       }
+
+      const clientTables = clientSqlEngine.getSchema(activeDatasetId);
+      setSchema(clientTables);
+      if (clientTables.length > 0) setActiveTable(clientTables[0]);
+
+      setStatusMessage(`Dataset '${DATASETS[activeDatasetId]?.name || activeDatasetId}' successfully reset.`);
+      setTimeout(() => setStatusMessage(null), 4000);
     } catch (err) {
       console.error('Failed to reset dataset:', err);
     } finally {
@@ -136,6 +207,37 @@ ORDER BY gpa DESC;`
   };
 
   const executeQuery = async (sql: string): Promise<ExecutionResponse> => {
+    // If backend is known to be unavailable, execute client-side immediately
+    if (isBackendAvailable.current === false) {
+      await clientSqlEngine.init();
+      const res = clientSqlEngine.executeSql(activeDatasetId, sql);
+
+      const totalRows = res.results.reduce((acc, r) => acc + (r.rowCount || r.rowsAffected || 0), 0);
+      addHistoryItem({
+        sql,
+        datasetId: activeDatasetId,
+        executionTimeMs: res.executionTimeMs || 0,
+        rowCount: totalRows,
+        success: res.success,
+        error: res.error,
+      });
+
+      const upper = sql.trim().toUpperCase();
+      if (
+        upper.startsWith('INSERT') ||
+        upper.startsWith('UPDATE') ||
+        upper.startsWith('DELETE') ||
+        upper.startsWith('CREATE') ||
+        upper.startsWith('DROP') ||
+        upper.startsWith('ALTER')
+      ) {
+        refreshSchema();
+      }
+
+      return res;
+    }
+
+    // Try backend first
     try {
       const res = await fetch('/api/execute', {
         method: 'POST',
@@ -149,20 +251,53 @@ ORDER BY gpa DESC;`
         }),
       });
 
-      const data: ExecutionResponse = await res.json();
+      const contentType = res.headers.get('content-type');
+      if (res.ok && contentType && contentType.includes('application/json')) {
+        isBackendAvailable.current = true;
+        const data: ExecutionResponse = await res.json();
 
-      // Log in history
-      const totalRows = data.results.reduce((acc, r) => acc + (r.rowCount || r.rowsAffected || 0), 0);
+        const totalRows = data.results.reduce((acc, r) => acc + (r.rowCount || r.rowsAffected || 0), 0);
+        addHistoryItem({
+          sql,
+          datasetId: activeDatasetId,
+          executionTimeMs: data.executionTimeMs || 0,
+          rowCount: totalRows,
+          success: data.success,
+          error: data.error,
+        });
+
+        const upper = sql.trim().toUpperCase();
+        if (
+          upper.startsWith('INSERT') ||
+          upper.startsWith('UPDATE') ||
+          upper.startsWith('DELETE') ||
+          upper.startsWith('CREATE') ||
+          upper.startsWith('DROP') ||
+          upper.startsWith('ALTER')
+        ) {
+          refreshSchema();
+        }
+
+        return data;
+      }
+
+      throw new Error('Backend API unreachable or returned non-JSON');
+    } catch {
+      // Fallback seamlessly to in-browser WebAssembly SQLite engine!
+      isBackendAvailable.current = false;
+      await clientSqlEngine.init();
+      const res = clientSqlEngine.executeSql(activeDatasetId, sql);
+
+      const totalRows = res.results.reduce((acc, r) => acc + (r.rowCount || r.rowsAffected || 0), 0);
       addHistoryItem({
         sql,
         datasetId: activeDatasetId,
-        executionTimeMs: data.executionTimeMs || 0,
+        executionTimeMs: res.executionTimeMs || 0,
         rowCount: totalRows,
-        success: data.success,
-        error: data.error,
+        success: res.success,
+        error: res.error,
       });
 
-      // If query was DDL or DML, refresh table counts/schemas automatically
       const upper = sql.trim().toUpperCase();
       if (
         upper.startsWith('INSERT') ||
@@ -175,23 +310,7 @@ ORDER BY gpa DESC;`
         refreshSchema();
       }
 
-      return data;
-    } catch (err: unknown) {
-      const errorMsg = err instanceof Error ? err.message : 'Network execution error';
-      addHistoryItem({
-        sql,
-        datasetId: activeDatasetId,
-        executionTimeMs: 0,
-        rowCount: 0,
-        success: false,
-        error: errorMsg,
-      });
-      return {
-        success: false,
-        results: [],
-        executionTimeMs: 0,
-        error: errorMsg,
-      };
+      return res;
     }
   };
 

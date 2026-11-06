@@ -61,7 +61,14 @@ cp .env.example .env
 ```
 *(No external database credentials or API keys are required for SQLite playground mode).*
 
-### 3. Start Development Server
+### 3. Deploying to Vercel (Instant Zero-Config Support)
+This application includes **Dual-Mode SQLite Architecture**:
+- When hosted on **Vercel**, **GitHub Pages**, or **Netlify** (where no persistent Node Express server is running), the application automatically executes queries directly inside the browser using **SQLite WebAssembly (`sql.js`)**!
+- All features—query execution, output table rendering, auto-graded challenges, schema exploration, and factory resets—work **100% client-side with 0ms network latency**.
+- `vercel.json` is pre-configured with SPA route rewrites.
+- Simply import your GitHub repository into Vercel and click **Deploy** (Framework preset: `Vite`, Build command: `npm run build`, Output directory: `dist`).
+
+### 4. Start Development Server (Full-Stack Mode)
 ```bash
 npm run dev
 ```

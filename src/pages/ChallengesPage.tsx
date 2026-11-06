@@ -24,6 +24,8 @@ import {
   Layers,
 } from 'lucide-react';
 
+import { clientSqlEngine } from '../services/sqlEngine.ts';
+
 export const ChallengesPage: React.FC = () => {
   const { switchDataset, setEditorSql, setActivePage } = useDatabase();
   const { theme } = useTheme();
@@ -32,6 +34,7 @@ export const ChallengesPage: React.FC = () => {
   const [challenges, setChallenges] = useState<Challenge[]>([]);
   const [selectedDifficulty, setSelectedDifficulty] = useState<string>('all');
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
+
   const [activeChallenge, setActiveChallenge] = useState<Challenge | null>(null);
 
   // Modal challenge state
@@ -43,13 +46,20 @@ export const ChallengesPage: React.FC = () => {
 
   useEffect(() => {
     fetch('/api/challenges')
-      .then(res => res.json())
-      .then(data => {
-        if (data.success && data.challenges) {
-          setChallenges(data.challenges);
+      .then(async res => {
+        const ct = res.headers.get('content-type');
+        if (res.ok && ct && ct.includes('application/json')) {
+          const data = await res.json();
+          if (data.success && data.challenges) {
+            setChallenges(data.challenges);
+            return;
+          }
         }
+        setChallenges(clientSqlEngine.getChallenges());
       })
-      .catch(err => console.error('Failed to load challenges:', err));
+      .catch(() => {
+        setChallenges(clientSqlEngine.getChallenges());
+      });
   }, []);
 
   const openChallenge = (challenge: Challenge) => {
@@ -67,16 +77,26 @@ export const ChallengesPage: React.FC = () => {
     setVerificationResult(null);
 
     try {
-      const res = await fetch('/api/verify-challenge', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          challengeId: activeChallenge.id,
-          sql: userQuery,
-        }),
-      });
+      let data: VerificationResult;
+      try {
+        const res = await fetch('/api/verify-challenge', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            challengeId: activeChallenge.id,
+            sql: userQuery,
+          }),
+        });
+        const ct = res.headers.get('content-type');
+        if (res.ok && ct && ct.includes('application/json')) {
+          data = await res.json();
+        } else {
+          data = await clientSqlEngine.verifyChallenge(activeChallenge.id, userQuery);
+        }
+      } catch {
+        data = await clientSqlEngine.verifyChallenge(activeChallenge.id, userQuery);
+      }
 
-      const data: VerificationResult = await res.json();
       setVerificationResult(data);
 
       if (data.passed) {
