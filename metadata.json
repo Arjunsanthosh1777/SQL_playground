@@ -1,0 +1,6 @@
+{
+  "name": "SQL Playground",
+  "description": "Interactive SQL learning and query execution platform with isolated SQLite practice databases, schema explorer, interactive challenges, and query history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
